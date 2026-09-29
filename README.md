@@ -23,16 +23,17 @@ Advisory file locks for Elixir using `flock(2)`.
 - **POSIX errors.** Failures come back as `{:error, :enoent}`,
   `{:error, :eacces}` and so on.
 
-See the `Flock` module docs for the full semantics.
+See the [documentation](https://hexdocs.pm/flock) for the full semantics.
 
-Supported on Linux and macOS, and on the BSDs with timed retries only.
+Tested on Linux and macOS. Other Unix systems should work, with timed retries
+in place of release notifications, but are untested.
 
 ## Installation
 
 ```elixir
 def deps do
   [
-    {:flock, "~> 0.1"}
+    {:flock, "~> 1.0"}
   ]
 end
 ```
