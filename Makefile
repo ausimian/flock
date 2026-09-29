@@ -1,16 +1,16 @@
-# Builds the Flock NIF. Invoked by elixir_make, which sets MIX_APP_PATH and
+# Builds the Flockit NIF. Invoked by elixir_make, which sets MIX_APP_PATH and
 # ERTS_INCLUDE_DIR.
 #
 # Targets:
-#   all      build $(MIX_APP_PATH)/priv/flock_nif.so
+#   all      build $(MIX_APP_PATH)/priv/flockit_nif.so
 #   analyze  run the clang static analyzer over the NIF source
 #   clean    remove build products
 
 PREFIX = $(MIX_APP_PATH)/priv
 BUILD = $(MIX_APP_PATH)/obj
-NIF = $(PREFIX)/flock_nif.so
-SRC = c_src/flock_nif.c
-OBJ = $(BUILD)/flock_nif.o
+NIF = $(PREFIX)/flockit_nif.so
+SRC = c_src/flockit_nif.c
+OBJ = $(BUILD)/flockit_nif.o
 
 ERTS_INCLUDE_DIR ?= $(shell erl -noshell -eval 'io:format("~ts/erts-~ts/include", [code:root_dir(), erlang:system_info(version)]), halt().')
 

@@ -1,14 +1,14 @@
-defmodule Flock do
+defmodule Flockit do
   @moduledoc """
   Advisory file locks using `flock(2)`.
 
-      {:ok, lock} = Flock.lock("/tmp/my.lock")
+      {:ok, lock} = Flockit.lock("/tmp/my.lock")
       # ... critical section ...
-      :ok = Flock.unlock(lock)
+      :ok = Flockit.unlock(lock)
 
   or, equivalently:
 
-      {:ok, result} = Flock.with_lock("/tmp/my.lock", fn -> critical_section() end)
+      {:ok, result} = Flockit.with_lock("/tmp/my.lock", fn -> critical_section() end)
 
   The lock file is created if it does not exist, and is never written to or
   removed. Locks are advisory: they only exclude other `flock(2)` users, in
@@ -51,14 +51,14 @@ defmodule Flock do
   A caller that times out or exits simply stops waiting; nothing is left
   behind.
 
-  Release notifications are pumped by a process in the `:flock` application,
+  Release notifications are pumped by a process in the `:flockit` application,
   which also closes the files of locks released by an owner exiting or by
   garbage collection, off the normal schedulers. It starts automatically when
-  `:flock` is a dependency. Without it, locks still work, but waiters rely on
+  `:flockit` is a dependency. Without it, locks still work, but waiters rely on
   timed retries and such files are closed during later calls into the
   library.
 
-      config :flock, max_poll_interval: 250
+      config :flockit, max_poll_interval: 250
 
   ## Platform notes
 
@@ -71,7 +71,7 @@ defmodule Flock do
   a VM restart.
   """
 
-  alias Flock.NIF
+  alias Flockit.NIF
 
   @min_poll_interval 10
 
@@ -117,7 +117,7 @@ defmodule Flock do
         # Registering before the next attempt means a release between the two
         # still produces a notification.
         _ = NIF.watch(lock)
-        max = Application.get_env(:flock, :max_poll_interval, 250)
+        max = Application.get_env(:flockit, :max_poll_interval, 250)
         attempt(lock, deadline, @min_poll_interval, max)
 
       {:error, _} = error ->
@@ -187,7 +187,7 @@ defmodule Flock do
 
   defp wait(lock, deadline, interval, max) do
     receive do
-      {:flock_released, ^lock} -> attempt(lock, deadline, interval, max)
+      {:flockit_released, ^lock} -> attempt(lock, deadline, interval, max)
     after
       min(interval, time_left(deadline)) ->
         attempt(lock, deadline, min(interval * 2, max), max)
@@ -204,7 +204,7 @@ defmodule Flock do
   # mailbox: the notifier sends while holding the registry mutex.
   defp flush(lock) do
     receive do
-      {:flock_released, ^lock} -> flush(lock)
+      {:flockit_released, ^lock} -> flush(lock)
     after
       0 -> :ok
     end

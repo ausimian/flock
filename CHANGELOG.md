@@ -8,8 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## 1.0.0 - 2026-09-29
 
-First stable release. The public API (`Flock.lock/2`, `Flock.try_lock/2`,
-`Flock.unlock/1` and `Flock.with_lock/3`) now follows semantic versioning.
+First stable release. The public API (`Flockit.lock/2`, `Flockit.try_lock/2`,
+`Flockit.unlock/1` and `Flockit.with_lock/3`) now follows semantic versioning.
 Tested on Linux and macOS.
 
 ### Added
