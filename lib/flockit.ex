@@ -67,8 +67,24 @@ defmodule Flockit do
   other special files `{:error, :einval}`. On NFS, `flock(2)` is emulated with
   byte-range locks, so exclusive locks need write access to the lock file.
 
-  Hot code upgrades of this library are not supported: upgrading it requires
-  a VM restart.
+  ## Hot code upgrades
+
+  A release upgrade can replace Flockit in a running VM. The new version takes
+  over held locks, waiting callers and release notifications from the old one.
+  In the appup, load the new modules over the old ones with `load_module`, and
+  give `Flockit` itself a soft post-purge:
+
+      {load_module, 'Elixir.Flockit', brutal_purge, soft_purge, []}
+
+  Callers waiting in `lock/2` or running `with_lock/3` are executing that
+  module's code, and a brutal post-purge would kill them. Removing the
+  application and adding it again, as `restart_application` does, is not
+  supported.
+
+  An upgrade to a version whose internal state is incompatible is refused:
+  `Flockit.NIF` fails to load, and the release handler restarts the system on
+  the old release. The changelog says when a version needs a restart. Upgrading
+  from 1.0.0 needs a VM restart.
   """
 
   alias Flockit.NIF

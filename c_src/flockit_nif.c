@@ -22,6 +22,11 @@
 // or a handle being garbage collected, so that unlocking, which can take a
 // network round trip, never runs in those callbacks on a normal scheduler.
 //
+// Everything that outlives a call is in one state_t, so that a new version
+// of the library, loaded over a running one as a separate instance, can adopt
+// it in upgrade and take over both resource types. The notifier, its select,
+// the registry and the close queue carry on unchanged.
+//
 // Locking order: lock_t.mtx before registry_mtx.
 
 #define _GNU_SOURCE
@@ -71,6 +76,7 @@ typedef struct closing {
 
 typedef struct lock lock_t;
 typedef struct watch watch_t;
+typedef struct kind kind_t;
 
 struct lock {
     ErlNifMutex* mtx;  // guards fd, state and monitored
@@ -81,6 +87,7 @@ struct lock {
     ErlNifPid owner;  // immutable once set
     ErlNifMonitor mon;
     closing_t* spare;  // close queue entry for a descriptor ended in a callback
+    kind_t* kind;      // the lock's resource type
 
     // Guarded by registry_mtx. A watched lock is on its watch's list, and the
     // registry holds a reference to it.
@@ -107,31 +114,55 @@ typedef struct {
     int fd;
 } notifier_t;
 
+// A lock resource type and its live locks. Reloading the module after a purge
+// opens a new type, but locks of the old one live on, so each type is kept
+// until its last lock is gone. Guarded by registry_mtx.
+struct kind {
+    ErlNifResourceType* type;
+    size_t locks;
+    kind_t* next;
+};
+
+// Bump whenever the layout or meaning of state_t, or of anything it reaches,
+// changes. An upgrade only adopts the state of a library with the same layout
+// version, and otherwise refuses, leaving the old version running.
+#define LAYOUT_VERSION 1
+
+// Everything that must outlive one instance of this library. An upgrade loads
+// the new library as a separate instance with fresh globals and hands this
+// over as priv_data, so nothing here may point into the library itself.
+typedef struct {
+    unsigned version;  // LAYOUT_VERSION; stays the first member in every layout
+    ErlNifMutex* registry_mtx;
+
+    // Everything below is guarded by registry_mtx.
+    kind_t* kinds;                      // newest first
+    notifier_t* notifier;               // created once, kept for the life of the VM
+    ErlNifResourceType* notifier_kind;  // the type notifier was created with
+    watch_t** table;                    // hash of watches by id
+    size_t table_size;
+    size_t nwatches;
+    watch_t* queue_head;  // pending watches, oldest first
+    watch_t* queue_tail;
+    int overflowed;  // every watch must be marked pending
+    size_t overflow_slot;
+    int nwatched;
+    intptr_t next_watch_id;  // kqueue only
+
+    // Descriptors waiting for the notifier to close them, oldest first.
+    closing_t* closing;
+    closing_t* closing_tail;
+    int close_signalled;
+    int attached;
+    ErlNifPid attached_pid;
+} state_t;
+
+// The state, shared by every instance of this library in the VM, and this
+// instance's resource types.
+static state_t* st = NULL;
 static ErlNifResourceType* lock_type = NULL;
+static kind_t* lock_kind = NULL;
 static ErlNifResourceType* notifier_type = NULL;
-
-// Everything below is guarded by registry_mtx.
-static ErlNifMutex* registry_mtx = NULL;
-static notifier_t* notifier = NULL;  // created once, kept for the life of the VM
-static watch_t** table = NULL;       // hash of watches by id
-static size_t table_size = 0;
-static size_t nwatches = 0;
-static watch_t* queue_head = NULL;  // pending watches, oldest first
-static watch_t* queue_tail = NULL;
-static int overflowed = 0;  // every watch must be marked pending
-static size_t overflow_slot = 0;
-static int nwatched = 0;
-#if defined(NOTIFY_KQUEUE)
-static intptr_t next_watch_id = 1;
-#endif
-
-// Descriptors waiting for the notifier to close them, oldest first.
-static closing_t* closing = NULL;
-static closing_t* closing_tail = NULL;
-static int close_signalled = 0;
-static int attached = 0;
-static ErlNifPid attached_pid;
-
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_error;
 static ERL_NIF_TERM atom_busy;
@@ -204,21 +235,21 @@ static void dispose_fd(ErlNifEnv* env, int fd, closing_t* c) {
     c->fd = fd;
     c->next = NULL;
 
-    enif_mutex_lock(registry_mtx);
-    if (closing_tail != NULL) {
-        closing_tail->next = c;
+    enif_mutex_lock(st->registry_mtx);
+    if (st->closing_tail != NULL) {
+        st->closing_tail->next = c;
     } else {
-        closing = c;
+        st->closing = c;
     }
-    closing_tail = c;
-    if (attached && !close_signalled && env != NULL) {
-        if (enif_send(env, &attached_pid, NULL, atom_flock_close)) {
-            close_signalled = 1;
+    st->closing_tail = c;
+    if (st->attached && !st->close_signalled && env != NULL) {
+        if (enif_send(env, &st->attached_pid, NULL, atom_flock_close)) {
+            st->close_signalled = 1;
         } else {
-            attached = 0;  // the notifier has gone; its successor re-attaches
+            st->attached = 0;  // the notifier has gone; its successor re-attaches
         }
     }
-    enif_mutex_unlock(registry_mtx);
+    enif_mutex_unlock(st->registry_mtx);
 }
 
 // Unlocks and closes up to max queued descriptors, oldest first. Returns
@@ -228,17 +259,17 @@ static int close_some(int max) {
     int count = 0;
     if (max > CLOSE_BATCH) max = CLOSE_BATCH;
 
-    enif_mutex_lock(registry_mtx);
-    while (closing != NULL && count < max) {
-        closing_t* c = closing;
-        closing = c->next;
-        if (closing == NULL) closing_tail = NULL;
+    enif_mutex_lock(st->registry_mtx);
+    while (st->closing != NULL && count < max) {
+        closing_t* c = st->closing;
+        st->closing = c->next;
+        if (st->closing == NULL) st->closing_tail = NULL;
         fds[count++] = c->fd;
         enif_free(c);
     }
-    int more = closing != NULL;
-    if (!more) close_signalled = 0;
-    enif_mutex_unlock(registry_mtx);
+    int more = st->closing != NULL;
+    if (!more) st->close_signalled = 0;
+    enif_mutex_unlock(st->registry_mtx);
 
     for (int i = 0; i < count; i++) unlock_fd(fds[i]);
     return more;
@@ -247,9 +278,9 @@ static int close_some(int max) {
 // From the library's dirty calls: with no notifier to empty the close queue,
 // each call takes a small share of it.
 static void help_close(void) {
-    enif_mutex_lock(registry_mtx);
-    int unattended = !attached && closing != NULL;
-    enif_mutex_unlock(registry_mtx);
+    enif_mutex_lock(st->registry_mtx);
+    int unattended = !st->attached && st->closing != NULL;
+    enif_mutex_unlock(st->registry_mtx);
     if (unattended) close_some(8);
 }
 
@@ -260,52 +291,52 @@ static size_t slot_of(intptr_t id, size_t size) {
 }
 
 static watch_t* find_watch(intptr_t id) {
-    if (table == NULL) return NULL;
-    for (watch_t* w = table[slot_of(id, table_size)]; w != NULL; w = w->hnext) {
+    if (st->table == NULL) return NULL;
+    for (watch_t* w = st->table[slot_of(id, st->table_size)]; w != NULL; w = w->hnext) {
         if (w->id == id) return w;
     }
     return NULL;
 }
 
 static int grow_table(void) {
-    size_t size = table_size == 0 ? 64 : table_size * 2;
+    size_t size = st->table_size == 0 ? 64 : st->table_size * 2;
     watch_t** grown = enif_alloc(size * sizeof(watch_t*));
     if (grown == NULL) return 0;
     memset(grown, 0, size * sizeof(watch_t*));
-    for (size_t i = 0; i < table_size; i++) {
-        for (watch_t *w = table[i], *next; w != NULL; w = next) {
+    for (size_t i = 0; i < st->table_size; i++) {
+        for (watch_t *w = st->table[i], *next; w != NULL; w = next) {
             next = w->hnext;
             size_t s = slot_of(w->id, size);
             w->hnext = grown[s];
             grown[s] = w;
         }
     }
-    if (table != NULL) enif_free(table);
-    table = grown;
-    table_size = size;
-    overflow_slot = 0;  // slots moved; rescan from the start
+    if (st->table != NULL) enif_free(st->table);
+    st->table = grown;
+    st->table_size = size;
+    st->overflow_slot = 0;  // slots moved; rescan from the start
     return 1;
 }
 
 static watch_t* add_to_watch(intptr_t id) {
     watch_t* w = find_watch(id);
     if (w != NULL) return w;
-    if (nwatches >= table_size && !grow_table()) return NULL;
+    if (st->nwatches >= st->table_size && !grow_table()) return NULL;
     if ((w = enif_alloc(sizeof(watch_t))) == NULL) return NULL;
     memset(w, 0, sizeof(watch_t));
     w->id = id;
-    size_t s = slot_of(id, table_size);
-    w->hnext = table[s];
-    table[s] = w;
-    nwatches++;
+    size_t s = slot_of(id, st->table_size);
+    w->hnext = st->table[s];
+    st->table[s] = w;
+    st->nwatches++;
     return w;
 }
 
 static void unhash_watch(watch_t* w) {
-    watch_t** p = &table[slot_of(w->id, table_size)];
+    watch_t** p = &st->table[slot_of(w->id, st->table_size)];
     while (*p != w) p = &(*p)->hnext;
     *p = w->hnext;
-    nwatches--;
+    st->nwatches--;
 }
 
 // Marks w for delivery. A watch already being delivered gets another full
@@ -318,18 +349,18 @@ static void mark_pending(watch_t* w) {
     w->pending = 1;
     w->cursor = w->locks;
     w->qnext = NULL;
-    if (queue_tail != NULL) {
-        queue_tail->qnext = w;
+    if (st->queue_tail != NULL) {
+        st->queue_tail->qnext = w;
     } else {
-        queue_head = w;
+        st->queue_head = w;
     }
-    queue_tail = w;
+    st->queue_tail = w;
 }
 
 static watch_t* dequeue(void) {
-    watch_t* w = queue_head;
-    queue_head = w->qnext;
-    if (queue_head == NULL) queue_tail = NULL;
+    watch_t* w = st->queue_head;
+    st->queue_head = w->qnext;
+    if (st->queue_head == NULL) st->queue_tail = NULL;
     w->pending = 0;
     return w;
 }
@@ -338,19 +369,19 @@ static watch_t* dequeue(void) {
 
 // Under l->mtx (l->fd is open) and registry_mtx.
 static int add_watch(lock_t* l) {
-    if (notifier == NULL) return 0;
+    if (st->notifier == NULL) return 0;
     intptr_t id;
 #if defined(NOTIFY_KQUEUE)
     struct kevent ev;
-    id = next_watch_id++;
+    id = st->next_watch_id++;
     EV_SET(&ev, l->fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, NOTE_FUNLOCK, 0, (void*)id);
-    if (kevent(notifier->fd, &ev, 1, NULL, 0, NULL) != 0) return 0;
+    if (kevent(st->notifier->fd, &ev, 1, NULL, 0, NULL) != 0) return 0;
 #elif defined(NOTIFY_INOTIFY)
     // Watching the open descriptor's /proc link pins the watch to the file we
     // opened, even if the path has since been renamed or replaced.
     char link[64];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", l->fd);
-    int wd = inotify_add_watch(notifier->fd, link, IN_CLOSE_WRITE | IN_CLOSE_NOWRITE);
+    int wd = inotify_add_watch(st->notifier->fd, link, IN_CLOSE_WRITE | IN_CLOSE_NOWRITE);
     if (wd < 0) return 0;
     id = wd;
 #else
@@ -361,10 +392,10 @@ static int add_watch(lock_t* l) {
     if (w == NULL) {
 #if defined(NOTIFY_KQUEUE)
         EV_SET(&ev, l->fd, EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
-        kevent(notifier->fd, &ev, 1, NULL, 0, NULL);
+        kevent(st->notifier->fd, &ev, 1, NULL, 0, NULL);
 #elif defined(NOTIFY_INOTIFY)
         // A missing watch means no other lock shares the kernel watch.
-        inotify_rm_watch(notifier->fd, wd);
+        inotify_rm_watch(st->notifier->fd, wd);
 #endif
         return 0;
     }
@@ -376,7 +407,7 @@ static int add_watch(lock_t* l) {
     if (w->locks != NULL) w->locks->wprev = l;
     w->locks = l;
     l->notified = 0;
-    nwatched++;
+    st->nwatched++;
     return 1;
 }
 
@@ -396,16 +427,16 @@ static int remove_watch(lock_t* l) {
     if (l->wnext != NULL) l->wnext->wprev = l->wprev;
     l->watch = NULL;
     l->wprev = l->wnext = NULL;
-    nwatched--;
+    st->nwatched--;
 
 #if defined(NOTIFY_KQUEUE)
     struct kevent ev;
     EV_SET(&ev, l->fd, EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
-    kevent(notifier->fd, &ev, 1, NULL, 0, NULL);
+    kevent(st->notifier->fd, &ev, 1, NULL, 0, NULL);
 #endif
     if (w->locks == NULL) {
 #if defined(NOTIFY_INOTIFY)
-        inotify_rm_watch(notifier->fd, (int)w->id);
+        inotify_rm_watch(st->notifier->fd, (int)w->id);
 #endif
         unhash_watch(w);
         if (w->pending) {
@@ -419,9 +450,9 @@ static int remove_watch(lock_t* l) {
 
 // Under l->mtx.
 static int unwatch(lock_t* l) {
-    enif_mutex_lock(registry_mtx);
+    enif_mutex_lock(st->registry_mtx);
     int had = remove_watch(l);
-    enif_mutex_unlock(registry_mtx);
+    enif_mutex_unlock(st->registry_mtx);
     return had;
 }
 
@@ -452,6 +483,35 @@ static void end_lock(ErlNifEnv* env, lock_t* l, int in_callback) {
     if (had) enif_release_resource(l);
 }
 
+// Lock types
+
+// Under registry_mtx. Makes type the one new locks are created with.
+static kind_t* adopt_kind(ErlNifResourceType* type) {
+    kind_t* newest = st->kinds;
+    if (newest != NULL && newest->type == type) return newest;  // taken over
+    kind_t* k = enif_alloc(sizeof(kind_t));
+    if (k == NULL) return NULL;
+    k->type = type;
+    k->locks = 0;
+    k->next = newest;
+    st->kinds = k;
+    if (newest != NULL && newest->locks == 0) {
+        k->next = newest->next;
+        enif_free(newest);
+    }
+    return k;
+}
+
+// Under registry_mtx. Drops a lock of kind k, and k itself once it is
+// superseded and has no locks left, before ERTS frees its type.
+static void release_kind(kind_t* k) {
+    if (--k->locks > 0 || k == st->kinds) return;
+    kind_t** p = &st->kinds;
+    while (*p != k) p = &(*p)->next;
+    *p = k->next;
+    enif_free(k);
+}
+
 // Resource callbacks
 
 static void lock_dtor(ErlNifEnv* env, void* obj) {
@@ -463,6 +523,11 @@ static void lock_dtor(ErlNifEnv* env, void* obj) {
         enif_free(l->spare);
     }
     if (l->mtx != NULL) enif_mutex_destroy(l->mtx);
+    if (l->kind != NULL) {
+        enif_mutex_lock(st->registry_mtx);
+        release_kind(l->kind);
+        enif_mutex_unlock(st->registry_mtx);
+    }
 }
 
 static void lock_down(ErlNifEnv* env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon) {
@@ -489,7 +554,17 @@ static int get_bool(ERL_NIF_TERM term, int* out) {
 }
 
 static int get_lock(ErlNifEnv* env, ERL_NIF_TERM term, lock_t** l) {
-    return enif_get_resource(env, term, lock_type, (void**)l);
+    if (enif_get_resource(env, term, lock_type, (void**)l)) return 1;
+
+    // Locks from before a purge and reload of the module have an older type.
+    // Each kind in the list has live locks, so its type has not been freed.
+    int found = 0;
+    enif_mutex_lock(st->registry_mtx);
+    for (kind_t* k = st->kinds; k != NULL && !found; k = k->next) {
+        found = k->type != lock_type && enif_get_resource(env, term, k->type, (void**)l);
+    }
+    enif_mutex_unlock(st->registry_mtx);
+    return found;
 }
 
 // Drops a lock that acquire_nif could not finish setting up. This runs on a
@@ -532,15 +607,15 @@ static ERL_NIF_TERM acquire_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
 
     // Only regular files are lockable. Linux refuses O_CREAT on a directory
     // but macOS does not, so directories are rejected explicitly too.
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) {
         err = errno;
         close(fd);
         return make_errno(env, err);
     }
-    if (!S_ISREG(st.st_mode)) {
+    if (!S_ISREG(sb.st_mode)) {
         close(fd);
-        return make_errno(env, S_ISDIR(st.st_mode) ? EISDIR : EINVAL);
+        return make_errno(env, S_ISDIR(sb.st_mode) ? EISDIR : EINVAL);
     }
 
     int op = exclusive ? LOCK_EX : LOCK_SH;
@@ -567,6 +642,10 @@ static ERL_NIF_TERM acquire_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
     l->op = op;
     l->state = rc == 0 ? ST_HELD : ST_OPEN;
     l->spare = spare;
+    enif_mutex_lock(st->registry_mtx);
+    l->kind = lock_kind;
+    lock_kind->locks++;
+    enif_mutex_unlock(st->registry_mtx);
 
     l->mtx = enif_mutex_create("flockit_lock");
     if (l->mtx == NULL) {
@@ -604,9 +683,9 @@ static ERL_NIF_TERM try_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     // Re-enable notifications before attempting, so that a release after
     // this attempt fails still produces a message.
-    enif_mutex_lock(registry_mtx);
+    enif_mutex_lock(st->registry_mtx);
     l->notified = 0;
-    enif_mutex_unlock(registry_mtx);
+    enif_mutex_unlock(st->registry_mtx);
 
     if (l->state == ST_HELD) {
         rc = 0;
@@ -641,13 +720,13 @@ static ERL_NIF_TERM watch_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
     int ok = 0;
     enif_mutex_lock(l->mtx);
     if (l->state == ST_OPEN) {
-        enif_mutex_lock(registry_mtx);
+        enif_mutex_lock(st->registry_mtx);
         ok = l->watch != NULL;
         if (!ok && add_watch(l)) {
             enif_keep_resource(l);
             ok = 1;
         }
-        enif_mutex_unlock(registry_mtx);
+        enif_mutex_unlock(st->registry_mtx);
     }
     enif_mutex_unlock(l->mtx);
     return ok ? atom_ok : atom_unavailable;
@@ -668,8 +747,8 @@ static ERL_NIF_TERM release_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
 static ERL_NIF_TERM notifier_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
 #if defined(NOTIFY_KQUEUE) || defined(NOTIFY_INOTIFY)
     ERL_NIF_TERM result;
-    enif_mutex_lock(registry_mtx);
-    if (notifier == NULL) {
+    enif_mutex_lock(st->registry_mtx);
+    if (st->notifier == NULL) {
 #if defined(NOTIFY_KQUEUE)
         int fd = kqueue();
         if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -678,15 +757,16 @@ static ERL_NIF_TERM notifier_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
 #endif
         if (fd < 0) {
             int err = errno;
-            enif_mutex_unlock(registry_mtx);
+            enif_mutex_unlock(st->registry_mtx);
             return make_errno(env, err);
         }
         // The reference from enif_alloc_resource is never released.
-        notifier = enif_alloc_resource(notifier_type, sizeof(notifier_t));
-        notifier->fd = fd;
+        st->notifier = enif_alloc_resource(notifier_type, sizeof(notifier_t));
+        st->notifier->fd = fd;
+        st->notifier_kind = notifier_type;
     }
-    result = enif_make_tuple2(env, atom_ok, enif_make_resource(env, notifier));
-    enif_mutex_unlock(registry_mtx);
+    result = enif_make_tuple2(env, atom_ok, enif_make_resource(env, st->notifier));
+    enif_mutex_unlock(st->registry_mtx);
     return result;
 #else
     return make_errno(env, ENOTSUP);
@@ -715,8 +795,8 @@ static int read_events(notifier_t* n) {
         struct inotify_event* ev = (struct inotify_event*)p;
         if (ev->mask & IN_Q_OVERFLOW) {
             // Events were lost, so any watched file may have been released.
-            overflowed = 1;
-            overflow_slot = 0;
+            st->overflowed = 1;
+            st->overflow_slot = 0;
         } else {
             // IN_IGNORED means a watch went away; its locks are woken to fall
             // back to retrying.
@@ -737,18 +817,18 @@ static int read_events(notifier_t* n) {
 static int deliver(ErlNifEnv* env) {
     int steps = DRAIN_STEPS;
 
-    while (overflowed && steps > 0) {
-        if (overflow_slot >= table_size) {
-            overflowed = 0;
+    while (st->overflowed && steps > 0) {
+        if (st->overflow_slot >= st->table_size) {
+            st->overflowed = 0;
             break;
         }
-        for (watch_t* w = table[overflow_slot]; w != NULL; w = w->hnext) mark_pending(w);
-        overflow_slot++;
+        for (watch_t* w = st->table[st->overflow_slot]; w != NULL; w = w->hnext) mark_pending(w);
+        st->overflow_slot++;
         steps--;
     }
 
-    while (queue_head != NULL && steps > 0) {
-        watch_t* w = queue_head;
+    while (st->queue_head != NULL && steps > 0) {
+        watch_t* w = st->queue_head;
         if (w->dead) {
             enif_free(dequeue());
             steps--;
@@ -771,33 +851,33 @@ static int deliver(ErlNifEnv* env) {
         }
     }
 
-    return overflowed || queue_head != NULL;
+    return st->overflowed || st->queue_head != NULL;
 }
 
 // Records the caller as the process that drains notifications and closes
 // descriptors, and tells it about any closes already queued.
 static void attach(ErlNifEnv* env) {
-    enif_self(env, &attached_pid);
-    attached = 1;
-    if (closing != NULL) {
-        close_signalled = 1;
-        enif_send(env, &attached_pid, NULL, atom_flock_close);
+    enif_self(env, &st->attached_pid);
+    st->attached = 1;
+    if (st->closing != NULL) {
+        st->close_signalled = 1;
+        enif_send(env, &st->attached_pid, NULL, atom_flock_close);
     }
 }
 
 // attach() -> ok. Makes the caller the closer when there are no notifications.
 static ERL_NIF_TERM attach_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    enif_mutex_lock(registry_mtx);
+    enif_mutex_lock(st->registry_mtx);
     attach(env);
-    enif_mutex_unlock(registry_mtx);
+    enif_mutex_unlock(st->registry_mtx);
     return atom_ok;
 }
 
 // detach() -> ok. From now on descriptors are closed where their lock ends.
 static ERL_NIF_TERM detach_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    enif_mutex_lock(registry_mtx);
-    attached = 0;
-    enif_mutex_unlock(registry_mtx);
+    enif_mutex_lock(st->registry_mtx);
+    st->attached = 0;
+    enif_mutex_unlock(st->registry_mtx);
     return atom_ok;
 }
 
@@ -808,16 +888,21 @@ static ERL_NIF_TERM detach_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 // process will be sent {select, Notifier, undefined, ready_input} when
 // further events arrive.
 static ERL_NIF_TERM drain_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    // The notifier keeps the type it was created with, even across a purge
+    // and reload, and that type lives as long as the notifier.
     notifier_t* n;
-    if (argc != 1 || !enif_get_resource(env, argv[0], notifier_type, (void**)&n)) {
+    enif_mutex_lock(st->registry_mtx);
+    ErlNifResourceType* type = st->notifier_kind;
+    enif_mutex_unlock(st->registry_mtx);
+    if (argc != 1 || type == NULL || !enif_get_resource(env, argv[0], type, (void**)&n)) {
         return enif_make_badarg(env);
     }
 
-    enif_mutex_lock(registry_mtx);
-    if (!attached) attach(env);
+    enif_mutex_lock(st->registry_mtx);
+    if (!st->attached) attach(env);
     int full = read_events(n);
     int remaining = deliver(env);
-    enif_mutex_unlock(registry_mtx);
+    enif_mutex_unlock(st->registry_mtx);
 
     if (full || remaining) return atom_more;
     int rc = enif_select(env, (ErlNifEvent)n->fd, ERL_NIF_SELECT_READ, n, NULL, atom_undefined);
@@ -835,13 +920,30 @@ static ERL_NIF_TERM close_pending_nif(ErlNifEnv* env, int argc, const ERL_NIF_TE
 
 // watch_count() -> integer(). Registered locks, for tests.
 static ERL_NIF_TERM watch_count_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    enif_mutex_lock(registry_mtx);
-    int count = nwatched;
-    enif_mutex_unlock(registry_mtx);
+    enif_mutex_lock(st->registry_mtx);
+    int count = st->nwatched;
+    enif_mutex_unlock(st->registry_mtx);
     return enif_make_int(env, count);
 }
 
-static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
+static state_t* new_state(void) {
+    state_t* s = enif_alloc(sizeof(state_t));
+    if (s == NULL) return NULL;
+    memset(s, 0, sizeof(state_t));
+    s->version = LAYOUT_VERSION;
+    s->next_watch_id = 1;
+    s->registry_mtx = enif_mutex_create("flockit_registry");
+    if (s->registry_mtx == NULL) {
+        enif_free(s);
+        return NULL;
+    }
+    return s;
+}
+
+// Sets up this instance once st is in place. Resource types are taken over
+// from the previous instance, if any, so its resources get this instance's
+// callbacks and it can be unloaded.
+static int init(ErlNifEnv* env) {
     atom_ok = enif_make_atom(env, "ok");
     atom_error = enif_make_atom(env, "error");
     atom_busy = enif_make_atom(env, "busy");
@@ -854,19 +956,39 @@ static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
     atom_unavailable = enif_make_atom(env, "unavailable");
     atom_undefined = enif_make_atom(env, "undefined");
 
-    // The never-released notifier keeps this library loaded, so a reload after
-    // a purge finds its statics intact and must not replace them.
-    if (registry_mtx == NULL) registry_mtx = enif_mutex_create("flockit_registry");
-    if (registry_mtx == NULL) return 1;
-
     ErlNifResourceFlags flags = ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER;
     ErlNifResourceTypeInit lock_init = {.dtor = lock_dtor, .down = lock_down};
     lock_type = enif_open_resource_type_x(env, "flockit_lock", &lock_init, flags, NULL);
 
     ErlNifResourceTypeInit notifier_init = {.stop = notifier_stop};
     notifier_type = enif_open_resource_type_x(env, "flockit_notifier", &notifier_init, flags, NULL);
+    if (lock_type == NULL || notifier_type == NULL) return 1;
 
-    return lock_type == NULL || notifier_type == NULL;
+    enif_mutex_lock(st->registry_mtx);
+    lock_kind = adopt_kind(lock_type);
+    enif_mutex_unlock(st->registry_mtx);
+    return lock_kind == NULL;
+}
+
+static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
+    // The never-released notifier keeps this library loaded, so a reload after
+    // a purge finds st intact and carries on with it.
+    if (st == NULL && (st = new_state()) == NULL) return 1;
+    *priv_data = st;
+    return init(env);
+}
+
+// Loading a new version over a running one. The new library is usually a
+// separate instance, with st still NULL, but reloading the same file finds
+// the running instance itself.
+static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data, ERL_NIF_TERM load_info) {
+    state_t* old = *old_priv_data;
+    // Version 1.0.0 kept its state in globals, out of reach.
+    if (old == NULL || old->version != LAYOUT_VERSION) return 1;
+    if (st != NULL && st != old) return 1;
+    st = old;
+    *priv_data = st;
+    return init(env);
 }
 
 static ErlNifFunc nif_funcs[] = {
@@ -883,6 +1005,4 @@ static ErlNifFunc nif_funcs[] = {
     {"watch_count", 0, watch_count_nif, 0},
 };
 
-// No upgrade callback: the notifier cannot be handed to a new library
-// instance, so upgrading requires a VM restart.
-ERL_NIF_INIT(Elixir.Flockit.NIF, nif_funcs, load, NULL, NULL, NULL)
+ERL_NIF_INIT(Elixir.Flockit.NIF, nif_funcs, load, NULL, upgrade, NULL)
