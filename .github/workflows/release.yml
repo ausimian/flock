@@ -1,0 +1,41 @@
+name: Release
+
+# Publishes the package and its docs to Hex when a version tag is pushed.
+# Tags are bare semver, as created by `mix publisho`: 1.2.3 or 1.2.3-rc.1.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+      - run: mix deps.get
+
+      - name: Check the tag matches @version
+        run: |
+          version=$(sed -n 's/^  @version "\(.*\)"$/\1/p' mix.exs)
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match @version $version in mix.exs"
+            exit 1
+          fi
+
+      - name: Test
+        run: mix test
+        env:
+          MIX_ENV: test
+
+      - name: Publish to Hex
+        run: mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
