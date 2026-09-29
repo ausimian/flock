@@ -62,12 +62,13 @@ defmodule Flock do
 
   ## Platform notes
 
-  Supported on Linux and macOS, and on the BSDs without release notifications.
-  Only regular files can be locked: directories give `{:error, :eisdir}` and
+  Tested on Linux and macOS. Other Unix systems should work, with timed retries
+  in place of release notifications, but are untested. Only regular files can be locked: directories give `{:error, :eisdir}` and
   other special files `{:error, :einval}`. On NFS, `flock(2)` is emulated with
   byte-range locks, so exclusive locks need write access to the lock file.
 
-  Upgrading this library requires a VM restart.
+  Hot code upgrades of this library are not supported: upgrading it requires
+  a VM restart.
   """
 
   alias Flock.NIF
