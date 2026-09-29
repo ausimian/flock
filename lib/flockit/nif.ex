@@ -1,12 +1,12 @@
-defmodule Flock.NIF do
+defmodule Flockit.NIF do
   @moduledoc false
 
   @on_load :load_nif
 
   def load_nif do
-    :flock
+    :flockit
     |> :code.priv_dir()
-    |> :filename.join(~c"flock_nif")
+    |> :filename.join(~c"flockit_nif")
     |> :erlang.load_nif(0)
   end
 

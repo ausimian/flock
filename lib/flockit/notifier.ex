@@ -1,4 +1,4 @@
-defmodule Flock.Notifier do
+defmodule Flockit.Notifier do
   @moduledoc false
 
   # Pumps the VM-wide release notifications: the NIF selects the notify
@@ -16,7 +16,7 @@ defmodule Flock.Notifier do
 
   require Logger
 
-  alias Flock.NIF
+  alias Flockit.NIF
 
   @retry_interval 5_000
 
@@ -49,8 +49,8 @@ defmodule Flock.Notifier do
     {:noreply, state}
   end
 
-  def handle_info(:flock_close, state) do
-    if NIF.close_pending() == :more, do: send(self(), :flock_close)
+  def handle_info(:flockit_close, state) do
+    if NIF.close_pending() == :more, do: send(self(), :flockit_close)
     {:noreply, state}
   end
 
@@ -67,7 +67,7 @@ defmodule Flock.Notifier do
 
       {:error, reason} ->
         Logger.warning(
-          "Flock could not set up release notifications (#{inspect(reason)}); " <>
+          "Flockit could not set up release notifications (#{inspect(reason)}); " <>
             "waiters will rely on timed retries until it can"
         )
 

@@ -1,4 +1,4 @@
-// flock_nif.c - advisory file locks via flock(2).
+// flockit_nif.c - advisory file locks via flock(2).
 //
 // Locks are only ever attempted with LOCK_NB, so no thread ever blocks in
 // flock(). A caller that has to wait registers its lock for release
@@ -11,7 +11,7 @@
 //          descriptor for the file is closed, including at process exit. An
 //          explicit LOCK_UN that keeps the descriptor open raises nothing.
 //
-// One notify descriptor serves the whole VM. The Flock.Notifier process
+// One notify descriptor serves the whole VM. The Flockit.Notifier process
 // watches it with enif_select. Watched locks are grouped into one watch per
 // kernel watch id; an event marks its watch pending, and each drain call
 // messages a bounded number of the pending watches' locks, resuming where it
@@ -87,7 +87,7 @@ struct lock {
     watch_t* watch;
     lock_t* wprev;
     lock_t* wnext;
-    int notified;  // a flock_released message is outstanding
+    int notified;  // a flockit_released message is outstanding
 };
 
 // The locks sharing one kernel watch id: on Linux all locks on one file, on
@@ -568,7 +568,7 @@ static ERL_NIF_TERM acquire_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
     l->state = rc == 0 ? ST_HELD : ST_OPEN;
     l->spare = spare;
 
-    l->mtx = enif_mutex_create("flock_lock");
+    l->mtx = enif_mutex_create("flockit_lock");
     if (l->mtx == NULL) {
         abandon(l);
         return make_errno(env, ENOMEM);
@@ -593,7 +593,7 @@ static ERL_NIF_TERM acquire_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
 // try(Lock) -> ok | {error, Reason}
 //
 // Another non-blocking attempt on a busy Lock. Success unregisters it, so
-// once this returns no further {flock_released, Lock} message will be sent.
+// once this returns no further {flockit_released, Lock} message will be sent.
 static ERL_NIF_TERM try_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     lock_t* l;
     if (argc != 1 || !get_lock(env, argv[0], &l)) return enif_make_badarg(env);
@@ -631,7 +631,7 @@ static ERL_NIF_TERM try_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
 // watch(Lock) -> ok | unavailable
 //
-// Registers a busy Lock so that its owner is sent {flock_released, Lock}
+// Registers a busy Lock so that its owner is sent {flockit_released, Lock}
 // whenever the file may have been unlocked. unavailable means only the
 // caller's fallback retries will notice a release.
 static ERL_NIF_TERM watch_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
@@ -846,8 +846,8 @@ static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
     atom_error = enif_make_atom(env, "error");
     atom_busy = enif_make_atom(env, "busy");
     atom_more = enif_make_atom(env, "more");
-    atom_flock_released = enif_make_atom(env, "flock_released");
-    atom_flock_close = enif_make_atom(env, "flock_close");
+    atom_flock_released = enif_make_atom(env, "flockit_released");
+    atom_flock_close = enif_make_atom(env, "flockit_close");
     atom_true = enif_make_atom(env, "true");
     atom_false = enif_make_atom(env, "false");
     atom_noproc = enif_make_atom(env, "noproc");
@@ -856,15 +856,15 @@ static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
 
     // The never-released notifier keeps this library loaded, so a reload after
     // a purge finds its statics intact and must not replace them.
-    if (registry_mtx == NULL) registry_mtx = enif_mutex_create("flock_registry");
+    if (registry_mtx == NULL) registry_mtx = enif_mutex_create("flockit_registry");
     if (registry_mtx == NULL) return 1;
 
     ErlNifResourceFlags flags = ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER;
     ErlNifResourceTypeInit lock_init = {.dtor = lock_dtor, .down = lock_down};
-    lock_type = enif_open_resource_type_x(env, "flock_lock", &lock_init, flags, NULL);
+    lock_type = enif_open_resource_type_x(env, "flockit_lock", &lock_init, flags, NULL);
 
     ErlNifResourceTypeInit notifier_init = {.stop = notifier_stop};
-    notifier_type = enif_open_resource_type_x(env, "flock_notifier", &notifier_init, flags, NULL);
+    notifier_type = enif_open_resource_type_x(env, "flockit_notifier", &notifier_init, flags, NULL);
 
     return lock_type == NULL || notifier_type == NULL;
 }
@@ -885,4 +885,4 @@ static ErlNifFunc nif_funcs[] = {
 
 // No upgrade callback: the notifier cannot be handed to a new library
 // instance, so upgrading requires a VM restart.
-ERL_NIF_INIT(Elixir.Flock.NIF, nif_funcs, load, NULL, NULL, NULL)
+ERL_NIF_INIT(Elixir.Flockit.NIF, nif_funcs, load, NULL, NULL, NULL)

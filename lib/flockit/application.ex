@@ -1,13 +1,13 @@
-defmodule Flock.Application do
+defmodule Flockit.Application do
   @moduledoc false
 
   use Application
 
-  alias Flock.NIF
+  alias Flockit.NIF
 
   @impl true
   def start(_type, _args) do
-    Supervisor.start_link([Flock.Notifier], strategy: :one_for_one, name: Flock.Supervisor)
+    Supervisor.start_link([Flockit.Notifier], strategy: :one_for_one, name: Flockit.Supervisor)
   end
 
   # With the notifier gone, locks ending from now on close their own

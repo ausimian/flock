@@ -1,4 +1,4 @@
-defmodule FlockTest do
+defmodule FlockitTest do
   use ExUnit.Case, async: true
 
   @moduletag :tmp_dir
@@ -11,7 +11,7 @@ defmodule FlockTest do
   defp elsewhere(fun), do: fun |> Task.async() |> Task.await()
 
   defp available?(path, mode \\ :exclusive) do
-    elsewhere(fn -> match?({:ok, _}, Flock.try_lock(path, mode: mode)) end)
+    elsewhere(fn -> match?({:ok, _}, Flockit.try_lock(path, mode: mode)) end)
   end
 
   # Releases triggered by a process exit or GC happen asynchronously.
@@ -29,11 +29,11 @@ defmodule FlockTest do
 
     pid =
       spawn(fn ->
-        {:ok, lock} = Flock.lock(path, opts)
+        {:ok, lock} = Flockit.lock(path, opts)
         send(parent, {:locked, self()})
 
         receive do
-          :unlock -> send(parent, {:unlocked, self(), Flock.unlock(lock)})
+          :unlock -> send(parent, {:unlocked, self(), Flockit.unlock(lock)})
           :stop -> :ok
         end
       end)
@@ -49,44 +49,44 @@ defmodule FlockTest do
 
   describe "exclusion" do
     test "an exclusive lock excludes all other lockers", %{path: path} do
-      {:ok, lock} = Flock.lock(path)
+      {:ok, lock} = Flockit.lock(path)
       refute available?(path, :exclusive)
       refute available?(path, :shared)
-      assert :ok = Flock.unlock(lock)
+      assert :ok = Flockit.unlock(lock)
       assert available?(path, :exclusive)
     end
 
     test "shared locks coexist but exclude exclusive ones", %{path: path} do
-      {:ok, lock} = Flock.lock(path, mode: :shared)
+      {:ok, lock} = Flockit.lock(path, mode: :shared)
       assert available?(path, :shared)
       refute available?(path, :exclusive)
-      Flock.unlock(lock)
+      Flockit.unlock(lock)
     end
 
     test "try_lock/2 reports a conflict as :eagain", %{path: path} do
-      {:ok, lock} = Flock.lock(path)
-      assert elsewhere(fn -> Flock.try_lock(path) end) == {:error, :eagain}
-      Flock.unlock(lock)
+      {:ok, lock} = Flockit.lock(path)
+      assert elsewhere(fn -> Flockit.try_lock(path) end) == {:error, :eagain}
+      Flockit.unlock(lock)
     end
 
     test "each call is a separate lock, even in the same process", %{path: path} do
-      {:ok, lock} = Flock.try_lock(path)
-      assert Flock.try_lock(path) == {:error, :eagain}
-      assert Flock.lock(path, timeout: 0) == {:error, :timeout}
-      Flock.unlock(lock)
+      {:ok, lock} = Flockit.try_lock(path)
+      assert Flockit.try_lock(path) == {:error, :eagain}
+      assert Flockit.lock(path, timeout: 0) == {:error, :timeout}
+      Flockit.unlock(lock)
     end
 
     test "creates the lock file", %{path: path} do
       refute File.exists?(path)
-      {:ok, lock} = Flock.try_lock(path, mode: :shared)
+      {:ok, lock} = Flockit.try_lock(path, mode: :shared)
       assert File.exists?(path)
-      Flock.unlock(lock)
+      Flockit.unlock(lock)
     end
 
     test "accepts chardata paths", %{path: path} do
-      {:ok, lock} = Flock.try_lock([Path.dirname(path), ?/, String.to_charlist("lock")])
+      {:ok, lock} = Flockit.try_lock([Path.dirname(path), ?/, String.to_charlist("lock")])
       refute available?(path)
-      Flock.unlock(lock)
+      Flockit.unlock(lock)
     end
 
     test "handles paths longer than 256 bytes", %{tmp_dir: dir} do
@@ -95,28 +95,28 @@ defmodule FlockTest do
       path = Path.join(deep, "lock")
       assert byte_size(path) > 300
 
-      {:ok, lock} = Flock.try_lock(path)
+      {:ok, lock} = Flockit.try_lock(path)
       refute available?(path)
-      Flock.unlock(lock)
+      Flockit.unlock(lock)
     end
   end
 
   describe "release" do
     test "unlock/1 is idempotent", %{path: path} do
-      {:ok, lock} = Flock.lock(path)
-      assert :ok = Flock.unlock(lock)
-      assert :ok = Flock.unlock(lock)
+      {:ok, lock} = Flockit.lock(path)
+      assert :ok = Flockit.unlock(lock)
+      assert :ok = Flockit.unlock(lock)
       assert available?(path)
     end
 
     test "unlock/1 works from another process", %{path: path} do
-      {:ok, lock} = Flock.lock(path)
-      assert elsewhere(fn -> Flock.unlock(lock) end) == :ok
+      {:ok, lock} = Flockit.lock(path)
+      assert elsewhere(fn -> Flockit.unlock(lock) end) == :ok
       assert available?(path)
     end
 
     test "unlock/1 rejects anything but a lock" do
-      assert_raise ArgumentError, fn -> Flock.unlock(make_ref()) end
+      assert_raise ArgumentError, fn -> Flockit.unlock(make_ref()) end
     end
 
     test "a lock is released when its owner is killed", %{path: path} do
@@ -137,7 +137,7 @@ defmodule FlockTest do
 
       pid =
         spawn(fn ->
-          {:ok, _} = Flock.try_lock(path)
+          {:ok, _} = Flockit.try_lock(path)
           :erlang.garbage_collect()
           send(parent, :collected)
           receive do: (:stop -> :ok)
@@ -153,18 +153,18 @@ defmodule FlockTest do
   describe "waiting" do
     test "lock/2 waits until the lock is free", %{path: path} do
       pid = holder(path)
-      task = Task.async(fn -> Flock.lock(path) end)
+      task = Task.async(fn -> Flockit.lock(path) end)
       assert Task.yield(task, 100) == nil
 
       unlock_holder(pid)
       assert {:ok, lock} = Task.await(task)
-      assert Flock.unlock(lock) == :ok
-      refute_received {:flock_released, _}
+      assert Flockit.unlock(lock) == :ok
+      refute_received {:flockit_released, _}
     end
 
     test "a shared waiter gets in once an exclusive lock is dropped", %{path: path} do
       pid = holder(path)
-      task = Task.async(fn -> match?({:ok, _}, Flock.lock(path, mode: :shared)) end)
+      task = Task.async(fn -> match?({:ok, _}, Flockit.lock(path, mode: :shared)) end)
       assert Task.yield(task, 50) == nil
       unlock_holder(pid)
       assert Task.await(task)
@@ -172,13 +172,13 @@ defmodule FlockTest do
 
     test "a timed-out lock/2 leaves no lock or message behind", %{path: path} do
       pid = holder(path)
-      assert Flock.lock(path, timeout: 50) == {:error, :timeout}
-      refute_received {:flock_released, _}
+      assert Flockit.lock(path, timeout: 50) == {:error, :timeout}
+      refute_received {:flockit_released, _}
 
       # Nothing of the timed-out attempt survives to hold up a later locker.
       unlock_holder(pid)
       eventually(fn -> available?(path) end)
-      refute_receive {:flock_released, _}, 100
+      refute_receive {:flockit_released, _}, 100
     end
 
     test "a waiter that exits stops waiting", %{path: path} do
@@ -187,7 +187,7 @@ defmodule FlockTest do
 
       waiter =
         spawn(fn ->
-          Flock.lock(path)
+          Flockit.lock(path)
           send(parent, :waiter_locked)
         end)
 
@@ -205,10 +205,10 @@ defmodule FlockTest do
 
       for i <- 1..5 do
         spawn(fn ->
-          {:ok, lock} = Flock.lock(path)
+          {:ok, lock} = Flockit.lock(path)
           send(parent, {:got, i})
           Process.sleep(10)
-          Flock.unlock(lock)
+          Flockit.unlock(lock)
         end)
       end
 
@@ -222,12 +222,12 @@ defmodule FlockTest do
       pid = holder(path)
 
       for _ <- 1..2048 do
-        assert Flock.lock(path, timeout: 0) == {:error, :timeout}
+        assert Flockit.lock(path, timeout: 0) == {:error, :timeout}
       end
 
-      refute_received {:flock_released, _}
+      refute_received {:flockit_released, _}
 
-      task = Task.async(fn -> match?({:ok, _}, Flock.lock(path, mode: :exclusive)) end)
+      task = Task.async(fn -> match?({:ok, _}, Flockit.lock(path, mode: :exclusive)) end)
       assert Task.yield(task, 50) == nil
       unlock_holder(pid)
       assert Task.await(task)
@@ -235,9 +235,9 @@ defmodule FlockTest do
 
     test "a timed-out shared waiter does not hold up a later exclusive one", %{path: path} do
       pid = holder(path)
-      assert Flock.lock(path, mode: :shared, timeout: 0) == {:error, :timeout}
+      assert Flockit.lock(path, mode: :shared, timeout: 0) == {:error, :timeout}
 
-      task = Task.async(fn -> match?({:ok, _}, Flock.lock(path)) end)
+      task = Task.async(fn -> match?({:ok, _}, Flockit.lock(path)) end)
       assert Task.yield(task, 50) == nil
       unlock_holder(pid)
       assert Task.await(task)
@@ -246,7 +246,7 @@ defmodule FlockTest do
     test "blocked waiters do not tie up dirty IO schedulers", %{path: path, tmp_dir: dir} do
       pid = holder(path)
       waiters = 2 * :erlang.system_info(:dirty_io_schedulers)
-      for _ <- 1..waiters, do: spawn(fn -> Flock.lock(path) end)
+      for _ <- 1..waiters, do: spawn(fn -> Flockit.lock(path) end)
       Process.sleep(100)
 
       other = Path.join(dir, "other")
@@ -261,49 +261,49 @@ defmodule FlockTest do
 
   describe "with_lock/3" do
     test "runs the function under the lock and releases it", %{path: path} do
-      assert Flock.with_lock(path, fn -> available?(path) end) == {:ok, false}
+      assert Flockit.with_lock(path, fn -> available?(path) end) == {:ok, false}
       assert available?(path)
     end
 
     test "releases the lock if the function raises", %{path: path} do
-      assert_raise RuntimeError, fn -> Flock.with_lock(path, fn -> raise "boom" end) end
+      assert_raise RuntimeError, fn -> Flockit.with_lock(path, fn -> raise "boom" end) end
       assert available?(path)
     end
 
     test "passes on lock errors", %{path: path} do
-      {:ok, lock} = Flock.try_lock(path)
-      assert Flock.with_lock(path, [timeout: 0], fn -> flunk("ran") end) == {:error, :timeout}
-      Flock.unlock(lock)
+      {:ok, lock} = Flockit.try_lock(path)
+      assert Flockit.with_lock(path, [timeout: 0], fn -> flunk("ran") end) == {:error, :timeout}
+      Flockit.unlock(lock)
     end
   end
 
   describe "errors" do
     test "a missing parent directory is :enoent", %{tmp_dir: dir} do
-      assert Flock.try_lock(Path.join([dir, "missing", "lock"])) == {:error, :enoent}
-      assert Flock.lock(Path.join([dir, "missing", "lock"])) == {:error, :enoent}
+      assert Flockit.try_lock(Path.join([dir, "missing", "lock"])) == {:error, :enoent}
+      assert Flockit.lock(Path.join([dir, "missing", "lock"])) == {:error, :enoent}
     end
 
     test "a directory cannot be locked", %{tmp_dir: dir} do
-      assert Flock.try_lock(dir) == {:error, :eisdir}
-      assert Flock.try_lock(dir, mode: :shared) == {:error, :eisdir}
+      assert Flockit.try_lock(dir) == {:error, :eisdir}
+      assert Flockit.try_lock(dir, mode: :shared) == {:error, :eisdir}
     end
 
     test "a FIFO is rejected without blocking", %{tmp_dir: dir} do
       fifo = Path.join(dir, "fifo")
       {_, 0} = System.cmd("mkfifo", [fifo])
-      assert Flock.try_lock(fifo, mode: :shared) == {:error, :einval}
-      assert Flock.try_lock(fifo) == {:error, :einval}
+      assert Flockit.try_lock(fifo, mode: :shared) == {:error, :einval}
+      assert Flockit.try_lock(fifo) == {:error, :einval}
     end
 
     test "a path containing NUL is :einval", %{tmp_dir: dir} do
-      assert Flock.try_lock(dir <> "/a\0b") == {:error, :einval}
+      assert Flockit.try_lock(dir <> "/a\0b") == {:error, :einval}
     end
 
     test "invalid options raise", %{path: path} do
-      assert_raise ArgumentError, fn -> Flock.lock(path, mode: :bogus) end
-      assert_raise ArgumentError, fn -> Flock.lock(path, timeout: -1) end
-      assert_raise ArgumentError, fn -> Flock.lock(path, bogus: true) end
-      assert_raise ArgumentError, fn -> Flock.try_lock(path, timeout: 10) end
+      assert_raise ArgumentError, fn -> Flockit.lock(path, mode: :bogus) end
+      assert_raise ArgumentError, fn -> Flockit.lock(path, timeout: -1) end
+      assert_raise ArgumentError, fn -> Flockit.lock(path, bogus: true) end
+      assert_raise ArgumentError, fn -> Flockit.try_lock(path, timeout: 10) end
     end
   end
 end

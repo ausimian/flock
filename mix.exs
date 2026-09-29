@@ -1,12 +1,12 @@
-defmodule Flock.MixProject do
+defmodule Flockit.MixProject do
   use Mix.Project
 
   @version "1.0.0"
-  @source_url "https://github.com/ausimian/flock"
+  @source_url "https://github.com/ausimian/flockit"
 
   def project do
     [
-      app: :flock,
+      app: :flockit,
       version: System.get_env("VERSION_OVERRIDE", @version),
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
@@ -27,7 +27,7 @@ defmodule Flock.MixProject do
 
   def application do
     [
-      mod: {Flock.Application, []},
+      mod: {Flockit.Application, []},
       extra_applications: [:logger],
       env: [max_poll_interval: 250]
     ]
@@ -66,7 +66,7 @@ defmodule Flock.MixProject do
 
   defp docs do
     [
-      main: "Flock",
+      main: "Flockit",
       extras: ["README.md", "CHANGELOG.md"],
       source_ref: @version,
       source_url: @source_url

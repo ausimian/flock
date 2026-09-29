@@ -1,8 +1,8 @@
-# Flock
+# Flockit
 
 Elixir library for advisory file locks via `flock(2)`, backed by a C NIF in
-`c_src/flock_nif.c`. Public API is in `lib/flock.ex`; `Flock.NIF` and
-`Flock.Notifier` are internal.
+`c_src/flockit_nif.c`. Public API is in `lib/flockit.ex`; `Flockit.NIF` and
+`Flockit.Notifier` are internal.
 
 ## Commands
 
@@ -18,9 +18,9 @@ Elixir library for advisory file locks via `flock(2)`, backed by a C NIF in
 ## How it works
 
 Nothing ever blocks in `flock()`. `lock/2` makes `LOCK_NB` attempts; between
-them the caller waits for a `{:flock_released, lock}` message or a backoff
+them the caller waits for a `{:flockit_released, lock}` message or a backoff
 timer. The messages come from one VM-wide notify descriptor (kqueue
-`NOTE_FUNLOCK` on macOS, inotify `IN_CLOSE_*` on Linux) that `Flock.Notifier`
+`NOTE_FUNLOCK` on macOS, inotify `IN_CLOSE_*` on Linux) that `Flockit.Notifier`
 watches with `enif_select`. Notifications only ever affect latency; the timed
 retries alone must keep the library correct.
 
