@@ -38,6 +38,11 @@ Invariants that earlier designs got wrong, so keep them:
   attempt so that a release in between still produces a message; `try` clears
   the lock's `notified` flag before attempting for the same reason.
 - **Lock ordering:** a lock's own mutex before `registry_mtx`.
+- **Upgradable state.** Everything that outlives a NIF call lives in
+  `state_t`, never in globals, and nothing in it points into the library
+  itself. Bump `LAYOUT_VERSION` whenever `state_t` or anything it reaches
+  changes in layout or meaning, and say in `RELEASE.md` that the version
+  needs a VM restart.
 - **No late locks.** `lock/2` never returns a lock after its `:timeout`
   expires (`timeout: 0` is a single attempt).
 
