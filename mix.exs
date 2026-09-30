@@ -1,7 +1,7 @@
 defmodule Flockit.MixProject do
   use Mix.Project
 
-  @version "1.0.0"
+  @version "1.1.0"
   @source_url "https://github.com/ausimian/flockit"
 
   def project do
