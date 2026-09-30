@@ -71,15 +71,22 @@ defmodule Flockit do
 
   A release upgrade can replace Flockit in a running VM. The new version takes
   over held locks, waiting callers and release notifications from the old one.
-  In the appup, load the new modules over the old ones with `load_module`, and
-  give `Flockit` itself a soft post-purge:
+  In the appup, load the new modules over the old ones, with soft purges for
+  the two modules that callers spend time in:
 
-      {load_module, 'Elixir.Flockit', brutal_purge, soft_purge, []}
+      {load_module, 'Elixir.Flockit.NIF', soft_purge, soft_purge, []},
+      {load_module, 'Elixir.Flockit', soft_purge, soft_purge, []}
 
-  Callers waiting in `lock/2` or running `with_lock/3` are executing that
-  module's code, and a brutal post-purge would kill them. Removing the
-  application and adding it again, as `restart_application` does, is not
-  supported.
+  Callers waiting in `lock/2` or running `with_lock/3` are executing
+  `Flockit`, and callers in the middle of a call into the NIF are executing
+  `Flockit.NIF`, so they keep running the old version for a while. A soft
+  post-purge leaves them be; with `brutal_purge`, they are killed when the
+  release is made permanent. A soft pre-purge makes a later upgrade that
+  finds callers still running code from the version before this one fail
+  with `{:error, {:old_processes, module}}` before it changes anything; with
+  `brutal_purge`, they are killed instead. Either way, a killed caller's locks
+  are released. Removing the application and adding it again, as
+  `restart_application` does, is not supported.
 
   An upgrade to a version whose internal state is incompatible is refused:
   `Flockit.NIF` fails to load, and the release handler restarts the system on

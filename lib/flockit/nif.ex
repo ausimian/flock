@@ -20,4 +20,5 @@ defmodule Flockit.NIF do
   def attach, do: :erlang.nif_error(:nif_not_loaded)
   def detach, do: :erlang.nif_error(:nif_not_loaded)
   def watch_count, do: :erlang.nif_error(:nif_not_loaded)
+  def kind_count, do: :erlang.nif_error(:nif_not_loaded)
 end

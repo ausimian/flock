@@ -126,7 +126,10 @@ struct kind {
 // Bump whenever the layout or meaning of state_t, or of anything it reaches,
 // changes. An upgrade only adopts the state of a library with the same layout
 // version, and otherwise refuses, leaving the old version running.
+// Overridable only so that tests can build a library with another layout.
+#ifndef LAYOUT_VERSION
 #define LAYOUT_VERSION 1
+#endif
 
 // Everything that must outlive one instance of this library. An upgrade loads
 // the new library as a separate instance with fresh globals and hands this
@@ -137,6 +140,7 @@ typedef struct {
 
     // Everything below is guarded by registry_mtx.
     kind_t* kinds;                      // newest first
+    notifier_t* anchor;                 // never released, see acquire_nif
     notifier_t* notifier;               // created once, kept for the life of the VM
     ErlNifResourceType* notifier_kind;  // the type notifier was created with
     watch_t** table;                    // hash of watches by id
@@ -226,16 +230,14 @@ static void unlock_fd(int fd) {
 
 // Closing
 
-// Queues fd, with its preallocated entry c, for unlocking and closing on a
-// dirty scheduler, and tells the notifier if it is not already busy with the
-// queue. Never blocks, so it is safe in resource callbacks. Without a
-// notifier the queue is emptied by the next attach, or a little at a time by
-// the library's own dirty calls (see close_some).
-static void dispose_fd(ErlNifEnv* env, int fd, closing_t* c) {
+// Under registry_mtx. Queues fd, with its preallocated entry c, for unlocking
+// and closing on a dirty scheduler, and tells the notifier if it is not
+// already busy with the queue. Never blocks, so it is safe in resource
+// callbacks. Without a notifier the queue is emptied by the next attach, or a
+// little at a time by the library's own dirty calls (see close_some).
+static void queue_close(ErlNifEnv* env, int fd, closing_t* c) {
     c->fd = fd;
     c->next = NULL;
-
-    enif_mutex_lock(st->registry_mtx);
     if (st->closing_tail != NULL) {
         st->closing_tail->next = c;
     } else {
@@ -249,6 +251,11 @@ static void dispose_fd(ErlNifEnv* env, int fd, closing_t* c) {
             st->attached = 0;  // the notifier has gone; its successor re-attaches
         }
     }
+}
+
+static void dispose_fd(ErlNifEnv* env, int fd, closing_t* c) {
+    enif_mutex_lock(st->registry_mtx);
+    queue_close(env, fd, c);
     enif_mutex_unlock(st->registry_mtx);
 }
 
@@ -516,18 +523,14 @@ static void release_kind(kind_t* k) {
 
 static void lock_dtor(ErlNifEnv* env, void* obj) {
     lock_t* l = obj;
-    // The registry holds a reference while l is watched, so it is not here.
-    if (l->fd >= 0) {
-        dispose_fd(env, l->fd, l->spare);
-    } else if (l->spare != NULL) {
-        enif_free(l->spare);
-    }
     if (l->mtx != NULL) enif_mutex_destroy(l->mtx);
-    if (l->kind != NULL) {
-        enif_mutex_lock(st->registry_mtx);
-        release_kind(l->kind);
-        enif_mutex_unlock(st->registry_mtx);
-    }
+    if (l->fd < 0 && l->spare != NULL) enif_free(l->spare);
+
+    // The registry holds a reference while l is watched, so it is not here.
+    enif_mutex_lock(st->registry_mtx);
+    if (l->fd >= 0) queue_close(env, l->fd, l->spare);
+    if (l->kind != NULL) release_kind(l->kind);
+    enif_mutex_unlock(st->registry_mtx);
 }
 
 static void lock_down(ErlNifEnv* env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon) {
@@ -645,6 +648,14 @@ static ERL_NIF_TERM acquire_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
     enif_mutex_lock(st->registry_mtx);
     l->kind = lock_kind;
     lock_kind->locks++;
+    // A resource of a type with callbacks keeps the library loaded. Once a
+    // lock exists, this one ensures a purge never unloads the library, and st
+    // with it, while descriptors may still be queued for closing, even when
+    // there is no notifier.
+    if (st->anchor == NULL) {
+        st->anchor = enif_alloc_resource(notifier_type, sizeof(notifier_t));
+        st->anchor->fd = -1;
+    }
     enif_mutex_unlock(st->registry_mtx);
 
     l->mtx = enif_mutex_create("flockit_lock");
@@ -892,13 +903,11 @@ static ERL_NIF_TERM drain_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
     // and reload, and that type lives as long as the notifier.
     notifier_t* n;
     enif_mutex_lock(st->registry_mtx);
-    ErlNifResourceType* type = st->notifier_kind;
-    enif_mutex_unlock(st->registry_mtx);
-    if (argc != 1 || type == NULL || !enif_get_resource(env, argv[0], type, (void**)&n)) {
+    if (argc != 1 || st->notifier_kind == NULL ||
+        !enif_get_resource(env, argv[0], st->notifier_kind, (void**)&n)) {
+        enif_mutex_unlock(st->registry_mtx);
         return enif_make_badarg(env);
     }
-
-    enif_mutex_lock(st->registry_mtx);
     if (!st->attached) attach(env);
     int full = read_events(n);
     int remaining = deliver(env);
@@ -916,6 +925,15 @@ static ERL_NIF_TERM drain_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
 // some are left and close_pending should be called again.
 static ERL_NIF_TERM close_pending_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     return close_some(CLOSE_BATCH) ? atom_more : atom_ok;
+}
+
+// kind_count() -> integer(). Lock types still tracked, for tests.
+static ERL_NIF_TERM kind_count_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    int count = 0;
+    enif_mutex_lock(st->registry_mtx);
+    for (kind_t* k = st->kinds; k != NULL; k = k->next) count++;
+    enif_mutex_unlock(st->registry_mtx);
+    return enif_make_int(env, count);
 }
 
 // watch_count() -> integer(). Registered locks, for tests.
@@ -958,21 +976,28 @@ static int init(ErlNifEnv* env) {
 
     ErlNifResourceFlags flags = ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER;
     ErlNifResourceTypeInit lock_init = {.dtor = lock_dtor, .down = lock_down};
-    lock_type = enif_open_resource_type_x(env, "flockit_lock", &lock_init, flags, NULL);
-
+    ErlNifResourceType* lt = enif_open_resource_type_x(env, "flockit_lock", &lock_init, flags, NULL);
     ErlNifResourceTypeInit notifier_init = {.stop = notifier_stop};
-    notifier_type = enif_open_resource_type_x(env, "flockit_notifier", &notifier_init, flags, NULL);
-    if (lock_type == NULL || notifier_type == NULL) return 1;
+    ErlNifResourceType* nt =
+        enif_open_resource_type_x(env, "flockit_notifier", &notifier_init, flags, NULL);
+    if (lt == NULL || nt == NULL) return 1;
 
     enif_mutex_lock(st->registry_mtx);
-    lock_kind = adopt_kind(lock_type);
+    kind_t* k = adopt_kind(lt);
     enif_mutex_unlock(st->registry_mtx);
-    return lock_kind == NULL;
+    if (k == NULL) return 1;
+
+    // Only now, since reloading the same file shares these with running code
+    // that must keep working if the load fails.
+    lock_type = lt;
+    notifier_type = nt;
+    lock_kind = k;
+    return 0;
 }
 
 static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
-    // The never-released notifier keeps this library loaded, so a reload after
-    // a purge finds st intact and carries on with it.
+    // The anchor keeps this library loaded, so a reload after a purge finds
+    // st intact and carries on with it.
     if (st == NULL && (st = new_state()) == NULL) return 1;
     *priv_data = st;
     return init(env);
@@ -1003,6 +1028,7 @@ static ErlNifFunc nif_funcs[] = {
     {"attach", 0, attach_nif, 0},
     {"detach", 0, detach_nif, 0},
     {"watch_count", 0, watch_count_nif, 0},
+    {"kind_count", 0, kind_count_nif, 0},
 };
 
 ERL_NIF_INIT(Elixir.Flockit.NIF, nif_funcs, load, NULL, upgrade, NULL)

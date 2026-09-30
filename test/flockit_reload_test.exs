@@ -54,33 +54,66 @@ defmodule FlockitReloadTest do
   #             loads a separate instance, as a release upgrade does;
   #   :purge    after deleting and purging the running version, which leaves
   #             the library loaded but its resource types retired.
-  defp reload(:upgrade, _dir), do: load_module()
+  #
+  # Between the delete and the reload, calls into Flockit.NIF would fail or
+  # load the module early, so the notifier and the given processes, which may
+  # make such calls, are suspended meanwhile.
+  defp reload(mode, dir, quiet \\ [])
 
-  defp reload(:copy, dir) do
-    lib = :code.lib_dir(:flockit)
-    copy = Path.join(dir, "flockit")
-    File.mkdir_p!(copy)
-    File.cp_r!(Path.join(lib, "ebin"), Path.join(copy, "ebin"))
-    File.cp_r!(Path.join(lib, "priv"), Path.join(copy, "priv"))
-    true = :code.replace_path(:flockit, String.to_charlist(Path.join(copy, "ebin")))
+  defp reload(:upgrade, _dir, _quiet), do: load_module()
 
-    try do
-      load_module()
-    after
-      true = :code.replace_path(:flockit, String.to_charlist(Path.join(lib, "ebin")))
-    end
+  defp reload(:copy, dir, _quiet) do
+    copy = copy_library(dir)
+    with_library(copy, &load_module/0)
 
     # Upgrade back to the original library: a later purge and reload finds
     # that file, and a new instance of it would not see the copy's state.
     on_exit(&load_module/0)
   end
 
-  defp reload(:purge, _dir) do
+  defp reload(:purge, _dir, quiet) do
     object_code = :code.get_object_code(NIF)
-    purge()
-    true = :code.delete(NIF)
-    purge()
-    load_binary(object_code)
+    quiet = [Process.whereis(Flockit.Notifier) | quiet]
+    Enum.each(quiet, &:erlang.suspend_process/1)
+
+    try do
+      purge()
+      true = :code.delete(NIF)
+      purge()
+      load_binary(object_code)
+    after
+      Enum.each(quiet, &:erlang.resume_process/1)
+    end
+  end
+
+  # Copies the library's ebin and priv under dir, rebuilding the NIF with
+  # extra C flags if given, and returns the copy's directory.
+  defp copy_library(dir, cflags \\ nil) do
+    lib = :code.lib_dir(:flockit)
+    copy = Path.join(dir, "flockit")
+    File.mkdir_p!(copy)
+    File.cp_r!(Path.join(lib, "ebin"), Path.join(copy, "ebin"))
+    File.cp_r!(Path.join(lib, "priv"), Path.join(copy, "priv"))
+
+    if cflags do
+      root = Path.expand("..", __DIR__)
+      env = [{"MIX_APP_PATH", copy}, {"CFLAGS", "-O2 " <> cflags}]
+      assert {_, 0} = System.cmd("make", ["-C", root, "-B"], env: env, stderr_to_stdout: true)
+    end
+
+    copy
+  end
+
+  # Runs fun with the code path, and so :code.priv_dir/1, pointing at copy.
+  defp with_library(copy, fun) do
+    lib = :code.lib_dir(:flockit)
+    true = :code.replace_path(:flockit, String.to_charlist(Path.join(copy, "ebin")))
+
+    try do
+      fun.()
+    after
+      true = :code.replace_path(:flockit, String.to_charlist(Path.join(lib, "ebin")))
+    end
   end
 
   defp load_module do
@@ -106,7 +139,7 @@ defmodule FlockitReloadTest do
         task = timed_lock(path)
         eventually(fn -> NIF.watch_count() == 1 end)
 
-        reload(unquote(mode), dir)
+        reload(unquote(mode), dir, [task.pid])
 
         # Between fallback retries at 630ms and 1270ms.
         Process.sleep(max(700 - (System.monotonic_time(:millisecond) - started), 0))
@@ -146,6 +179,55 @@ defmodule FlockitReloadTest do
         assert {:ok, lock} = Flockit.try_lock(before)
         Flockit.unlock(lock)
       end
+    end
+  end
+
+  describe "lock types" do
+    test "are dropped once their last lock is gone", %{tmp_dir: dir} do
+      # Locks left by earlier tests may keep the current type; start afresh.
+      reload(:purge, dir)
+      initial = NIF.kind_count()
+      a = holder(Path.join(dir, "a"))
+      reload(:purge, dir)
+      assert NIF.kind_count() == initial + 1
+      b = holder(Path.join(dir, "b"))
+      reload(:purge, dir)
+      assert NIF.kind_count() == initial + 2
+
+      Process.exit(a, :kill)
+      eventually(fn -> NIF.kind_count() == initial + 1 end)
+      Process.exit(b, :kill)
+      eventually(fn -> NIF.kind_count() == initial end)
+
+      # The newest type has no locks, so a reload replaces it.
+      reload(:purge, dir)
+      assert NIF.kind_count() == initial
+    end
+  end
+
+  describe "an upgrade to another state layout" do
+    @tag :capture_log
+    test "is refused, and the running version carries on", %{tmp_dir: dir} do
+      disable_fallback()
+      path = Path.join(dir, "lock")
+      {:ok, held} = Flockit.lock(path)
+      task = timed_lock(path)
+      eventually(fn -> NIF.watch_count() == 1 end)
+
+      copy = copy_library(dir, "-DLAYOUT_VERSION=2")
+
+      with_library(copy, fn ->
+        {NIF, binary, file} = :code.get_object_code(NIF)
+        purge()
+        assert :code.load_binary(NIF, file, binary) == {:error, :on_load_failure}
+      end)
+
+      Process.sleep(700)
+      unlocked_at = System.monotonic_time(:millisecond)
+      assert Flockit.unlock(held) == :ok
+      assert {{:ok, lock}, locked_at} = Task.await(task)
+      assert locked_at - unlocked_at < 200
+      Flockit.unlock(lock)
     end
   end
 end
